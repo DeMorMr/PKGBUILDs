@@ -6,14 +6,143 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: arch-repo-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: PKGBUILDs
+  RELEASE_TAG: arch-repo
+
 jobs:
   build:
+    name: Build packages and repository database
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Build and Publish Repo
-        uses: Jguer/Arch-Repo-Action@v1
         with:
-          repo-name: 'PKGBUILDs'
+          persist-credentials: false
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          pacman -Syu --noconfirm --needed git sudo
+
+          useradd --create-home builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' \
+            > /etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+
+          mkdir -p /tmp/packages
+          chown builder:builder /tmp/packages
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Build packages
+        run: |
+          set -euo pipefail
+
+          count=0
+
+          while IFS= read -r -d '' pkgbuild; do
+            pkgdir="$(dirname "$pkgbuild")"
+
+            if [[ -e "$pkgdir/.ci-skip" ]]; then
+              echo "Skipping: $pkgdir"
+              continue
+            fi
+
+            echo "::group::Building $pkgdir"
+
+            (
+              cd "$pkgdir"
+              sudo -H -u builder \
+                env PKGDEST=/tmp/packages \
+                makepkg --syncdeps --noconfirm --cleanbuild
+            )
+
+            echo "::endgroup::"
+            count=$((count + 1))
+          done < <(
+            find . -type d -name .git -prune -o \
+              -type f -name PKGBUILD -print0
+          )
+
+          if (( count == 0 )); then
+            echo "No PKGBUILD files found, or all packages were skipped."
+            exit 1
+          fi
+
+      - name: Create repository database
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          packages=(/tmp/packages/*.pkg.tar.zst)
+
+          if (( ${#packages[@]} == 0 )); then
+            echo "No .pkg.tar.zst packages were produced."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/repository"
+          cp "${packages[@]}" "$GITHUB_WORKSPACE/repository/"
+
+          cd "$GITHUB_WORKSPACE/repository"
+          repo-add "$REPO_NAME.db.tar.gz" ./*.pkg.tar.zst
+
+          # Release assets must be regular files, not symlinks.
+          rm -f "$REPO_NAME.db" "$REPO_NAME.files"
+          cp "$REPO_NAME.db.tar.gz" "$REPO_NAME.db"
+          cp "$REPO_NAME.files.tar.gz" "$REPO_NAME.files"
+
+      - name: Upload repository artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-repository
+          path: repository/
+          if-no-files-found: error
+
+  publish:
+    name: Publish repository
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download repository artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-repository
+          path: repository
+
+      - name: Create release and upload files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --target "$TARGET_SHA" \
+              --title "Arch Linux repository" \
+              --notes "Packages and repository database built by GitHub Actions."
+          fi
+
+          gh release upload "$RELEASE_TAG" repository/* --clobber

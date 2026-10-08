@@ -16,4 +16,4 @@ jobs:
       - name: Build and Publish Repo
         uses: Jguer/Arch-Repo-Action@v1
         with:
-          repo-name: 'myrepo'
+          repo-name: 'PKGBUILDs'
